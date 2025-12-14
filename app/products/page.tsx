@@ -1,12 +1,13 @@
 'use client';
 
 import { useEffect, useState } from "react";
-import { collection, onSnapshot } from "firebase/firestore";
+import { collection, onSnapshot, query, where } from "firebase/firestore";
 import { Plus, Save } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { createProduct, updateProduct } from "@/lib/firestore-actions";
 import { Product } from "@/lib/types";
 import { formatMoney } from "@/lib/utils";
+import { useAuth } from "@/context/auth-context";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,9 +24,15 @@ export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [form, setForm] = useState({ id: "", name: "", defaultPrice: "" });
   const [saving, setSaving] = useState(false);
+  const { tenantId } = useAuth();
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "products"), (snap) => {
+    if (!tenantId) return undefined;
+    const productsQuery = query(
+      collection(db, "products"),
+      where("tenantId", "==", tenantId),
+    );
+    const unsub = onSnapshot(productsQuery, (snap) => {
       setProducts(
         snap.docs.map((doc) => {
           const data = doc.data() as Omit<Product, "id"> & Partial<Product>;
@@ -34,21 +41,24 @@ export default function ProductsPage() {
       );
     });
     return () => unsub();
-  }, []);
+  }, [tenantId]);
 
   const handleCreate = async () => {
+    if (!tenantId) return;
     setSaving(true);
     await createProduct({
       id: form.id || undefined,
       name: form.name,
       defaultPrice: Number(form.defaultPrice || 0),
+      tenantId,
     });
     setSaving(false);
     setForm({ id: "", name: "", defaultPrice: "" });
   };
 
   const handlePriceChange = async (product: Product, value: number) => {
-    await updateProduct(product.id, { defaultPrice: value });
+    if (!tenantId) return;
+    await updateProduct(product.id, { defaultPrice: value }, tenantId);
   };
 
   return (
@@ -90,7 +100,7 @@ export default function ProductsPage() {
           />
           <Button
             className="w-full"
-            disabled={saving || !form.name}
+            disabled={saving || !form.name || !tenantId}
             onClick={handleCreate}
           >
             <Plus className="mr-2 h-4 w-4" />

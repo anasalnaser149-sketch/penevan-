@@ -21,9 +21,16 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     setFormError(undefined);
     try {
       await signIn(email, password);
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      setFormError("Login failed. Check your credentials.");
+      // Handle specific Firebase auth errors
+      if (error?.code === "auth/invalid-credential" || error?.code === "auth/wrong-password" || error?.code === "auth/user-not-found") {
+        setFormError("Invalid email or password. Please try again.");
+      } else if (error?.code === "auth/too-many-requests") {
+        setFormError("Too many failed attempts. Please try again later.");
+      } else {
+        setFormError("Login failed. Check your credentials.");
+      }
     } finally {
       setSubmitting(false);
     }

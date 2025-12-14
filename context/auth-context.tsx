@@ -25,6 +25,7 @@ interface AuthContextValue {
   isAdmin: boolean;
   isAllowed: boolean;
   role?: "admin" | "staff";
+  tenantId?: string;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
@@ -77,9 +78,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setLoading(true);
     try {
       await signInWithEmailAndPassword(auth, email, password);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setError("Unable to sign in. Check credentials.");
+      // Set a more specific error message based on error code
+      if (err?.code === "auth/invalid-credential" || err?.code === "auth/wrong-password" || err?.code === "auth/user-not-found") {
+        setError("Invalid email or password.");
+      } else if (err?.code === "auth/too-many-requests") {
+        setError("Too many failed attempts. Please try again later.");
+      } else {
+        setError("Unable to sign in. Check credentials.");
+      }
       setLoading(false);
       throw err;
     }
@@ -97,6 +105,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isAdmin: (!!user && user.uid === ADMIN_UID) || role === "admin",
       isAllowed: !!user && isAllowed,
       role,
+      tenantId: user?.uid,
       signIn,
       signOut: signOutUser,
     }),

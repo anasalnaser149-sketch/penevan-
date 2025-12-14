@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { collection, onSnapshot } from "firebase/firestore";
+import { collection, onSnapshot, query, where } from "firebase/firestore";
 import { Pencil, Plus, ToggleLeft, ToggleRight } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { createStore, updateStore } from "@/lib/firestore-actions";
 import { Store, StoreBalance } from "@/lib/types";
 import { formatMoney } from "@/lib/utils";
+import { useAuth } from "@/context/auth-context";
 import {
   Card,
   CardContent,
@@ -38,9 +39,12 @@ export default function StoresPage() {
   });
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const { tenantId } = useAuth();
 
   useEffect(() => {
-    const unsubStores = onSnapshot(collection(db, "stores"), (snap) => {
+    if (!tenantId) return undefined;
+    const storeQuery = query(collection(db, "stores"), where("tenantId", "==", tenantId));
+    const unsubStores = onSnapshot(storeQuery, (snap) => {
       setStores(
         snap.docs.map((doc) => {
           const data = doc.data() as Omit<Store, "id"> & Partial<Store>;
@@ -48,7 +52,11 @@ export default function StoresPage() {
         }),
       );
     });
-    const unsubBalances = onSnapshot(collection(db, "store_balances"), (snap) => {
+    const balanceQuery = query(
+      collection(db, "store_balances"),
+      where("tenantId", "==", tenantId),
+    );
+    const unsubBalances = onSnapshot(balanceQuery, (snap) => {
       const map: Record<string, StoreBalance> = {};
       snap.forEach((doc) => (map[doc.id] = doc.data() as StoreBalance));
       setBalances(map);
@@ -57,18 +65,20 @@ export default function StoresPage() {
       unsubStores();
       unsubBalances();
     };
-  }, []);
+  }, [tenantId]);
 
   const handleCreate = async () => {
+    if (!tenantId) return;
     setSaving(true);
-    await createStore({ ...storeForm, active: true });
+    await createStore({ ...storeForm, active: true, tenantId });
     setSaving(false);
     setOpen(false);
     setStoreForm({ name: "", phone: "", location: "", notes: "" });
   };
 
   const toggleActive = async (store: Store) => {
-    await updateStore(store.id, { active: !store.active });
+    if (!tenantId) return;
+    await updateStore(store.id, { active: !store.active }, tenantId);
   };
 
   return (
@@ -128,7 +138,7 @@ export default function StoresPage() {
               />
               <Button
                 className="w-full"
-                disabled={saving || !storeForm.name}
+                disabled={saving || !storeForm.name || !tenantId}
                 onClick={handleCreate}
               >
                 {saving ? "Saving..." : "Create"}

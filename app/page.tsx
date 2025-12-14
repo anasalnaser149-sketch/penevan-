@@ -22,6 +22,7 @@ import { createStore } from "@/lib/firestore-actions";
 import { OWNER_PHONE } from "@/lib/constants";
 import { Store as StoreType, StoreBalance, SalesRecord } from "@/lib/types";
 import { formatMoney } from "@/lib/utils";
+import { useAuth } from "@/context/auth-context";
 import {
   Card,
   CardContent,
@@ -54,9 +55,12 @@ export default function DashboardPage() {
     location: "",
     notes: "",
   });
+  const { tenantId } = useAuth();
 
   useEffect(() => {
-    const unsubStores = onSnapshot(collection(db, "stores"), (snap) => {
+    if (!tenantId) return undefined;
+    const storesQuery = query(collection(db, "stores"), where("tenantId", "==", tenantId));
+    const unsubStores = onSnapshot(storesQuery, (snap) => {
       setStores(
         snap.docs.map((doc) => {
           const data = doc.data() as Omit<StoreType, "id"> & Partial<StoreType>;
@@ -65,7 +69,11 @@ export default function DashboardPage() {
       );
     });
 
-    const unsubBalances = onSnapshot(collection(db, "store_balances"), (snap) => {
+    const balanceQuery = query(
+      collection(db, "store_balances"),
+      where("tenantId", "==", tenantId),
+    );
+    const unsubBalances = onSnapshot(balanceQuery, (snap) => {
       const next: Record<string, StoreBalance> = {};
       snap.forEach((doc) => {
         next[doc.id] = { ...(doc.data() as StoreBalance) };
@@ -77,17 +85,16 @@ export default function DashboardPage() {
     const todayEnd = Timestamp.fromDate(endOfDay(new Date()));
     const salesQuery = query(
       collection(db, "sales_records"),
+      where("tenantId", "==", tenantId),
       where("date", ">=", todayStart),
       where("date", "<=", todayEnd),
     );
     const unsubSales = onSnapshot(salesQuery, (snap) => {
       setSalesToday(
-        snap.docs.map(
-          (doc) => {
-            const data = doc.data() as Omit<SalesRecord, "id"> & Partial<SalesRecord>;
-            return { ...data, id: doc.id } as SalesRecord;
-          },
-        ),
+        snap.docs.map((doc) => {
+          const data = doc.data() as Omit<SalesRecord, "id"> & Partial<SalesRecord>;
+          return { ...data, id: doc.id } as SalesRecord;
+        }),
       );
     });
 
@@ -96,7 +103,7 @@ export default function DashboardPage() {
       unsubBalances();
       unsubSales();
     };
-  }, []);
+  }, [tenantId]);
 
   const totalOutstanding = useMemo(() => {
     return Object.values(balances).reduce(
@@ -113,10 +120,12 @@ export default function DashboardPage() {
   );
 
   const handleCreateStore = async () => {
+    if (!tenantId) return;
     setCreating(true);
     await createStore({
       ...storeForm,
       active: true,
+      tenantId,
     });
     setCreating(false);
     setDialogOpen(false);
@@ -124,11 +133,9 @@ export default function DashboardPage() {
   };
 
   const dailyReportMessage = useMemo(() => {
-    const totalSales = salesToday.reduce(
-      (sum, sale) => sum + (sale.totalAmount ?? 0),
-      0,
-    );
-    const totalTickets = salesToday.length;
+    const validSales = salesToday.filter((sale) => !sale.voided);
+    const totalSales = validSales.reduce((sum, sale) => sum + (sale.totalAmount ?? 0), 0);
+    const totalTickets = validSales.length;
     return `Penevan daily report:
 ${new Date().toLocaleDateString()}
 Sales tickets: ${totalTickets}
@@ -204,7 +211,7 @@ Total sales: ${formatMoney(totalSales)}`;
                 />
                 <Button
                   onClick={handleCreateStore}
-                  disabled={creating || !storeForm.name}
+                  disabled={creating || !storeForm.name || !tenantId}
                   className="w-full"
                 >
                   {creating ? "Saving..." : "Create Store"}

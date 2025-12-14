@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   collection,
   onSnapshot,
-  orderBy,
   query,
   where,
   Timestamp,
@@ -16,6 +15,7 @@ import { db } from "@/lib/firebase";
 import { OWNER_PHONE } from "@/lib/constants";
 import { SalesRecord, Store, Payment } from "@/lib/types";
 import { formatMoney } from "@/lib/utils";
+import { useAuth } from "@/context/auth-context";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -49,44 +49,61 @@ export default function ReportsPage() {
     payments: Payment[];
   }>({ sales: [], payments: [] });
   const [stores, setStores] = useState<Store[]>([]);
+  const { tenantId } = useAuth();
 
   useEffect(() => {
+    if (!tenantId) return undefined;
     const { start, end } = getRange(range);
     const startTs = Timestamp.fromDate(start);
     const endTs = Timestamp.fromDate(end);
 
     const salesQ = query(
       collection(db, "sales_records"),
+      where("tenantId", "==", tenantId),
       where("date", ">=", startTs),
       where("date", "<=", endTs),
-      orderBy("date", "desc"),
     );
     const payQ = query(
       collection(db, "payments"),
+      where("tenantId", "==", tenantId),
       where("date", ">=", startTs),
       where("date", "<=", endTs),
-      orderBy("date", "desc"),
     );
 
     const unsubSales = onSnapshot(salesQ, (snap) => {
-      setData((prev) => ({
-        ...prev,
-        sales: snap.docs.map((doc) => {
+      const salesData = snap.docs
+        .map((doc) => {
           const data = doc.data() as Omit<SalesRecord, "id"> & Partial<SalesRecord>;
           return { ...data, id: doc.id };
-        }),
+        })
+        .sort((a, b) => {
+          const aDate = a.date?.toMillis() ?? 0;
+          const bDate = b.date?.toMillis() ?? 0;
+          return bDate - aDate; // Descending order
+        });
+      setData((prev) => ({
+        ...prev,
+        sales: salesData,
       }));
     });
     const unsubPayments = onSnapshot(payQ, (snap) => {
-      setData((prev) => ({
-        ...prev,
-        payments: snap.docs.map((doc) => {
+      const paymentsData = snap.docs
+        .map((doc) => {
           const data = doc.data() as Omit<Payment, "id"> & Partial<Payment>;
           return { ...data, id: doc.id };
-        }),
+        })
+        .sort((a, b) => {
+          const aDate = a.date?.toMillis() ?? 0;
+          const bDate = b.date?.toMillis() ?? 0;
+          return bDate - aDate; // Descending order
+        });
+      setData((prev) => ({
+        ...prev,
+        payments: paymentsData,
       }));
     });
-    const unsubStores = onSnapshot(collection(db, "stores"), (snap) => {
+    const storesQuery = query(collection(db, "stores"), where("tenantId", "==", tenantId));
+    const unsubStores = onSnapshot(storesQuery, (snap) => {
       setStores(
         snap.docs.map((doc) => {
           const data = doc.data() as Omit<Store, "id"> & Partial<Store>;
@@ -100,12 +117,14 @@ export default function ReportsPage() {
       unsubPayments();
       unsubStores();
     };
-  }, [range]);
+  }, [range, tenantId]);
 
   const totals = useMemo(() => {
-    const revenue = sales.reduce((sum, s) => sum + (s.totalAmount ?? 0), 0);
-    const collected = payments.reduce((sum, p) => sum + (p.amount ?? 0), 0);
-    const perStore = sales.reduce<Record<string, number>>((acc, s) => {
+    const activeSales = sales.filter((s) => !s.voided);
+    const activePayments = payments.filter((p) => !p.voided);
+    const revenue = activeSales.reduce((sum, s) => sum + (s.totalAmount ?? 0), 0);
+    const collected = activePayments.reduce((sum, p) => sum + (p.amount ?? 0), 0);
+    const perStore = activeSales.reduce<Record<string, number>>((acc, s) => {
       acc[s.storeId] = (acc[s.storeId] ?? 0) + (s.totalAmount ?? 0);
       return acc;
     }, {});
@@ -169,7 +188,7 @@ export default function ReportsPage() {
           <select
             value={range}
             onChange={(e) => setRange(e.target.value as RangeKey)}
-            className="w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-sm text-slate-100 sm:w-auto"
+            className="w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-base text-slate-100 sm:w-auto"
           >
             <option value="this-month">This Month</option>
             <option value="last-month">Last Month</option>

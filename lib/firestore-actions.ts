@@ -6,9 +6,11 @@ import {
   runTransaction,
   setDoc,
   Timestamp,
+  updateDoc,
 } from "firebase/firestore";
 import { db } from "./firebase";
 import {
+  ActivityActionType,
   InventoryLogItem,
   Product,
   SalesRecordItem,
@@ -19,54 +21,95 @@ import {
   UserRole,
 } from "./types";
 
+function assertTenantMatch(existingTenantId: string | undefined, tenantId: string) {
+  if (existingTenantId && existingTenantId !== tenantId) {
+    throw new Error("Unauthorized access to another tenant's data.");
+  }
+}
+
+async function logActivity(params: {
+  tenantId: string;
+  storeId: string;
+  actionId: string;
+  actionType: ActivityActionType;
+  amount: number;
+  items?: SalesRecordItem[];
+}) {
+  const { tenantId, storeId, actionId, actionType, amount, items } = params;
+  await addDoc(collection(db, "activityLog"), {
+    tenantId,
+    storeId,
+    actionId,
+    actionType,
+    amount,
+    items: items ?? [],
+    voided: false,
+    createdAt: Timestamp.now(),
+  });
+}
+
 export async function createStore(input: Omit<Store, "id">) {
   const id = crypto.randomUUID();
   const ref = doc(db, "stores", id);
-  await setDoc(ref, { ...input, id, active: input.active ?? true });
+  await setDoc(ref, {
+    ...input,
+    id,
+    active: input.active ?? true,
+    tenantId: input.tenantId,
+  });
   await setDoc(
     doc(db, "store_balances", id),
-    { storeId: id, currentBalance: 0, currentStock: {} },
+    { storeId: id, tenantId: input.tenantId, currentBalance: 0, currentStock: {} },
     { merge: true },
   );
   return id;
 }
 
-export async function updateStore(id: string, data: Partial<Store>) {
+export async function updateStore(id: string, data: Partial<Store>, tenantId: string) {
   const ref = doc(db, "stores", id);
-  await setDoc(ref, { ...data, id }, { merge: true });
+  const snap = await getDoc(ref);
+  const existing = snap.data() as Partial<Store> | undefined;
+  assertTenantMatch(existing?.tenantId, tenantId);
+  await setDoc(ref, { ...data, id, tenantId }, { merge: true });
 }
 
 export async function createProduct(input: Omit<Product, "id"> & { id?: string }) {
   const id = input.id ?? crypto.randomUUID();
-  await setDoc(doc(db, "products", id), { ...input, id });
+  await setDoc(doc(db, "products", id), { ...input, id, tenantId: input.tenantId });
   return id;
 }
 
-export async function updateProduct(id: string, data: Partial<Product>) {
+export async function updateProduct(id: string, data: Partial<Product>, tenantId: string) {
   const ref = doc(db, "products", id);
-  await setDoc(ref, { ...data, id }, { merge: true });
+  const snap = await getDoc(ref);
+  const existing = snap.data() as Partial<Product> | undefined;
+  assertTenantMatch(existing?.tenantId, tenantId);
+  await setDoc(ref, { ...data, id, tenantId }, { merge: true });
 }
 
 export async function setStorePricing(pricing: StorePricing) {
   const id = pricing.id ?? `${pricing.storeId}_${pricing.productId}`;
-  await setDoc(doc(db, "store_pricing", id), { ...pricing, id });
+  await setDoc(doc(db, "store_pricing", id), { ...pricing, id, tenantId: pricing.tenantId });
 }
 
 export async function recordDelivery(params: {
   storeId: string;
   productId: string;
   quantity: number;
+  tenantId: string;
 }) {
-  const { storeId, productId, quantity } = params;
+  const { storeId, productId, quantity, tenantId } = params;
   const balanceRef = doc(db, "store_balances", storeId);
 
   await runTransaction(db, async (tx) => {
     const snap = await tx.get(balanceRef);
     const data = (snap.data() as StoreBalance | undefined) ?? {
       storeId,
+      tenantId,
       currentBalance: 0,
       currentStock: {},
     };
+    assertTenantMatch(data.tenantId, tenantId);
 
     const updatedStock = {
       ...data.currentStock,
@@ -77,6 +120,7 @@ export async function recordDelivery(params: {
       balanceRef,
       {
         storeId,
+        tenantId,
         currentBalance: data.currentBalance ?? 0,
         currentStock: updatedStock,
       },
@@ -86,6 +130,7 @@ export async function recordDelivery(params: {
 
   await addDoc(collection(db, "inventory_log"), {
     storeId,
+    tenantId,
     type: "DELIVERY",
     date: Timestamp.now(),
     items: [{ productId, quantity }],
@@ -97,8 +142,9 @@ export async function recordStockCount(params: {
   counts: InventoryLogItem[];
   pricingMap: Map<string, number>;
   products: Product[];
+  tenantId: string;
 }) {
-  const { storeId, counts, pricingMap, products } = params;
+  const { storeId, counts, pricingMap, products, tenantId } = params;
   const balanceRef = doc(db, "store_balances", storeId);
 
   const getPrice = (productId: string) => {
@@ -114,9 +160,11 @@ export async function recordStockCount(params: {
     const snap = await tx.get(balanceRef);
     const data = (snap.data() as StoreBalance | undefined) ?? {
       storeId,
+      tenantId,
       currentBalance: 0,
       currentStock: {},
     };
+    assertTenantMatch(data.tenantId, tenantId);
     const currentStock = data.currentStock ?? {};
     const nextStock: Record<string, number> = { ...currentStock };
 
@@ -144,6 +192,7 @@ export async function recordStockCount(params: {
       balanceRef,
       {
         storeId,
+        tenantId,
         currentStock: nextStock,
         currentBalance: (data.currentBalance ?? 0) + totalAmount,
       },
@@ -156,17 +205,28 @@ export async function recordStockCount(params: {
     type: "COUNT",
     date: Timestamp.now(),
     items: counts,
+    tenantId,
   });
 
   let salesRecordId: string | undefined;
   if (salesItems.length) {
     const salesDoc = await addDoc(collection(db, "sales_records"), {
       storeId,
+      tenantId,
       date: Timestamp.now(),
       items: salesItems,
       totalAmount,
+      voided: false,
     });
     salesRecordId = salesDoc.id;
+    await logActivity({
+      tenantId,
+      storeId,
+      actionId: salesDoc.id,
+      actionType: "SALE",
+      amount: totalAmount,
+      items: salesItems,
+    });
   }
 
   return { salesRecordId, totalAmount };
@@ -176,30 +236,97 @@ export async function recordPayment(params: {
   storeId: string;
   amount: number;
   note?: string;
+  tenantId: string;
 }) {
-  const { storeId, amount, note } = params;
+  const { storeId, amount, note, tenantId } = params;
   const balanceRef = doc(db, "store_balances", storeId);
 
   await runTransaction(db, async (tx) => {
     const snap = await tx.get(balanceRef);
     const data = (snap.data() as StoreBalance | undefined) ?? {
       storeId,
+      tenantId,
       currentBalance: 0,
       currentStock: {},
     };
+    assertTenantMatch(data.tenantId, tenantId);
     const newBalance = (data.currentBalance ?? 0) - amount;
     tx.set(
       balanceRef,
-      { storeId, currentBalance: newBalance, currentStock: data.currentStock },
+      { storeId, tenantId, currentBalance: newBalance, currentStock: data.currentStock },
       { merge: true },
     );
   });
 
-  await addDoc(collection(db, "payments"), {
+  const paymentDoc = await addDoc(collection(db, "payments"), {
     storeId,
     amount,
     note,
     date: Timestamp.now(),
+    tenantId,
+    voided: false,
+  });
+  await logActivity({
+    tenantId,
+    storeId,
+    actionId: paymentDoc.id,
+    actionType: "PAYMENT",
+    amount,
+  });
+}
+
+export async function voidEntry(params: {
+  entryId: string;
+  entryType: "SALE" | "PAYMENT";
+  storeId: string;
+  tenantId: string;
+  amount: number;
+  items?: SalesRecordItem[];
+}) {
+  const { entryId, entryType, storeId, tenantId, amount, items } = params;
+  const balanceRef = doc(db, "store_balances", storeId);
+
+  await runTransaction(db, async (tx) => {
+    const balanceSnap = await tx.get(balanceRef);
+    const balanceData = (balanceSnap.data() as StoreBalance | undefined) ?? {
+      storeId,
+      tenantId,
+      currentBalance: 0,
+      currentStock: {},
+    };
+    assertTenantMatch(balanceData.tenantId, tenantId);
+
+    let newBalance = balanceData.currentBalance ?? 0;
+    const updatedStock = { ...(balanceData.currentStock || {}) };
+
+    if (entryType === "SALE") {
+      // Reverse sale: subtract from balance, add back to stock
+      newBalance = newBalance - amount;
+      if (items) {
+        items.forEach((item) => {
+          const qty = item.quantitySold || 0;
+          updatedStock[item.productId] = (updatedStock[item.productId] || 0) + qty;
+        });
+      }
+      const saleRef = doc(db, "sales_records", entryId);
+      tx.update(saleRef, { voided: true, voidedAt: Timestamp.now() });
+    } else if (entryType === "PAYMENT") {
+      // Reverse payment: add back to balance
+      newBalance = newBalance + amount;
+      const paymentRef = doc(db, "payments", entryId);
+      tx.update(paymentRef, { voided: true, voidedAt: Timestamp.now() });
+    }
+
+    tx.set(
+      balanceRef,
+      {
+        storeId,
+        tenantId,
+        currentBalance: newBalance,
+        currentStock: updatedStock,
+      },
+      { merge: true },
+    );
   });
 }
 

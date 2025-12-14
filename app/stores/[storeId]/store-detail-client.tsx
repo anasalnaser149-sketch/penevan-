@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   collection,
   doc,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -18,6 +19,7 @@ import {
   Package,
   Plus,
   RefreshCcw,
+  Trash2,
   Wallet,
 } from "lucide-react";
 import jsPDF from "jspdf";
@@ -29,17 +31,20 @@ import {
   recordStockCount,
   setStorePricing,
   updateStore,
+  voidEntry,
 } from "@/lib/firestore-actions";
 import {
   InventoryLog,
   Payment,
   Product,
   SalesRecord,
+  SalesRecordItem,
   Store,
   StoreBalance,
   StorePricing,
 } from "@/lib/types";
 import { formatDate, formatMoney } from "@/lib/utils";
+import { useAuth } from "@/context/auth-context";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -68,6 +73,7 @@ type Props = {
 const toDate = (value?: Timestamp) => (value ? value.toDate() : new Date());
 
 export default function StoreDetailClient({ storeId }: Props) {
+  const { tenantId } = useAuth();
   const [store, setStore] = useState<Store | null>(null);
   const [balance, setBalance] = useState<StoreBalance | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
@@ -78,32 +84,58 @@ export default function StoreDetailClient({ storeId }: Props) {
 
   const [deliveryOpen, setDeliveryOpen] = useState(false);
   const [deliveryProduct, setDeliveryProduct] = useState("");
-  const [deliveryQty, setDeliveryQty] = useState(0);
+  const [deliveryQty, setDeliveryQty] = useState<string>("");
+  const [deliveryError, setDeliveryError] = useState<string>();
 
-  const [countValues, setCountValues] = useState<Record<string, number>>({});
+  const [countValues, setCountValues] = useState<Record<string, string>>({});
+  const [countErrors, setCountErrors] = useState<Record<string, string>>({});
   const [countMessage, setCountMessage] = useState<string>();
 
   const [paymentAmount, setPaymentAmount] = useState<string>("");
   const [paymentNote, setPaymentNote] = useState<string>("");
 
   const [updatingStore, setUpdatingStore] = useState(false);
+  const [removingEntryId, setRemovingEntryId] = useState<string | null>(null);
+  const [unauthorized, setUnauthorized] = useState(false);
 
   useEffect(() => {
-    if (!storeId) return;
-    const unsubStore = onSnapshot(doc(db, "stores", storeId), (snap) => {
+    if (!storeId || !tenantId) return undefined;
+    const storeRef = doc(db, "stores", storeId);
+    const unsubStore = onSnapshot(storeRef, (snap) => {
       if (snap.exists()) {
         const data = snap.data() as Omit<Store, "id"> & Partial<Store>;
+        if (data.tenantId && data.tenantId !== tenantId) {
+          setUnauthorized(true);
+          setStore(null);
+          return;
+        }
+        setUnauthorized(false);
         setStore({ ...data, id: snap.id });
+      } else {
+        setStore(null);
       }
     });
 
-    const unsubBalance = onSnapshot(doc(db, "store_balances", storeId), (snap) => {
+    const balanceRef = doc(db, "store_balances", storeId);
+    const unsubBalance = onSnapshot(balanceRef, (snap) => {
       if (snap.exists()) {
-        setBalance(snap.data() as StoreBalance);
+        const data = snap.data() as StoreBalance;
+        if (data.tenantId && data.tenantId !== tenantId) {
+          setUnauthorized(true);
+          setBalance(null);
+          return;
+        }
+        setBalance(data);
+      } else {
+        setBalance(null);
       }
     });
 
-    const unsubProducts = onSnapshot(collection(db, "products"), (snap) => {
+    const productsQuery = query(
+      collection(db, "products"),
+      where("tenantId", "==", tenantId),
+    );
+    const unsubProducts = onSnapshot(productsQuery, (snap) => {
       setProducts(
         snap.docs.map((doc) => {
           const data = doc.data() as Omit<Product, "id"> & Partial<Product>;
@@ -115,6 +147,7 @@ export default function StoreDetailClient({ storeId }: Props) {
     const pricingQuery = query(
       collection(db, "store_pricing"),
       where("storeId", "==", storeId),
+      where("tenantId", "==", tenantId),
     );
     const unsubPricing = onSnapshot(pricingQuery, (snap) => {
       setPricing(
@@ -128,6 +161,7 @@ export default function StoreDetailClient({ storeId }: Props) {
     const logsQuery = query(
       collection(db, "inventory_log"),
       where("storeId", "==", storeId),
+      where("tenantId", "==", tenantId),
       orderBy("date", "desc"),
     );
     const unsubLogs = onSnapshot(logsQuery, (snap) => {
@@ -142,6 +176,7 @@ export default function StoreDetailClient({ storeId }: Props) {
     const salesQuery = query(
       collection(db, "sales_records"),
       where("storeId", "==", storeId),
+      where("tenantId", "==", tenantId),
       orderBy("date", "desc"),
     );
     const unsubSales = onSnapshot(salesQuery, (snap) => {
@@ -156,6 +191,7 @@ export default function StoreDetailClient({ storeId }: Props) {
     const paymentsQuery = query(
       collection(db, "payments"),
       where("storeId", "==", storeId),
+      where("tenantId", "==", tenantId),
       orderBy("date", "desc"),
     );
     const unsubPayments = onSnapshot(paymentsQuery, (snap) => {
@@ -176,13 +212,17 @@ export default function StoreDetailClient({ storeId }: Props) {
       unsubSales();
       unsubPayments();
     };
-  }, [storeId]);
+  }, [storeId, tenantId]);
 
   useEffect(() => {
-    if (!balance?.currentStock) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setCountValues(balance.currentStock);
-  }, [balance?.currentStock]);
+    setDeliveryQty("");
+    setDeliveryProduct("");
+    setDeliveryError(undefined);
+    setCountValues({});
+    setCountErrors({});
+    setCountMessage(undefined);
+  }, [storeId, tenantId]);
+
 
   const priceMap = useMemo(() => {
     const map = new Map<string, number>();
@@ -197,33 +237,77 @@ export default function StoreDetailClient({ storeId }: Props) {
     return `https://wa.me/${store.phone || ""}?text=${encodeURIComponent(text)}`;
   }, [balance?.currentBalance, store]);
 
+  const validateQuantity = (raw: string, max?: number) => {
+    if (raw === undefined || raw === null || raw === "") return "Quantity is required.";
+    const parsed = Number(raw);
+    if (Number.isNaN(parsed)) return "Enter a valid number.";
+    if (parsed < 0) return "Quantity cannot be negative.";
+    if (typeof max === "number" && parsed > max) {
+      return "Quantity cannot exceed delivered quantity.";
+    }
+    return null;
+  };
+
   const handleDelivery = async () => {
-    if (!deliveryProduct || deliveryQty <= 0) return;
+    if (!tenantId) return;
+    if (!deliveryProduct) {
+      setDeliveryError("Select a product.");
+      return;
+    }
+    const error = validateQuantity(deliveryQty);
+    if (error) {
+      setDeliveryError(error);
+      return;
+    }
+    const qty = Number(deliveryQty);
     await recordDelivery({
       storeId,
       productId: deliveryProduct,
-      quantity: deliveryQty,
+      quantity: qty,
+      tenantId,
     });
-    setDeliveryQty(0);
+    setDeliveryQty("");
+    setDeliveryError(undefined);
+    setDeliveryProduct("");
     setDeliveryOpen(false);
   };
 
   const handleCount = async () => {
-    const counts = products.map((product) => ({
-      productId: product.id,
-      quantity: Number(
-        countValues[product.id] ??
-          balance?.currentStock?.[product.id] ??
-          0,
-      ),
-    }));
+    if (!tenantId) return;
+    if (!balance) {
+      setCountMessage("Balance data not ready. Please try again.");
+      return;
+    }
+    const nextErrors: Record<string, string> = {};
+    const counts = products
+      .map((product) => {
+        const raw = countValues[product.id];
+        const max = balance.currentStock?.[product.id] ?? 0;
+        const error = validateQuantity(raw ?? "", max);
+        if (error) {
+          nextErrors[product.id] = error;
+          return null;
+        }
+        return { productId: product.id, quantity: Number(raw) };
+      })
+      .filter(Boolean) as { productId: string; quantity: number }[];
+
+    if (Object.keys(nextErrors).length > 0) {
+      setCountErrors(nextErrors);
+      setCountMessage("Please fix the highlighted quantities.");
+      return;
+    }
+
+    setCountErrors({});
     try {
       const res = await recordStockCount({
         storeId,
         counts,
         pricingMap: priceMap,
         products,
+        tenantId,
       });
+      setCountValues({});
       setCountMessage(
         res.totalAmount > 0
           ? `Sales recorded. Added ${formatMoney(res.totalAmount)} to balance.`
@@ -237,16 +321,54 @@ export default function StoreDetailClient({ storeId }: Props) {
   };
 
   const handlePayment = async () => {
+    if (!tenantId) return;
     const amount = Number(paymentAmount);
-    if (!amount || amount <= 0) return;
-    await recordPayment({ storeId, amount, note: paymentNote });
+    if (!paymentAmount || Number.isNaN(amount) || amount <= 0) return;
+    await recordPayment({ storeId, amount, note: paymentNote, tenantId });
     setPaymentAmount("");
     setPaymentNote("");
   };
 
   const setPricingForProduct = async (productId: string, price: number) => {
-    await setStorePricing({ storeId, productId, price });
+    if (!tenantId) return;
+    await setStorePricing({ storeId, productId, price, tenantId });
   };
+
+  const handleRemoveEntry = async (entry: {
+    id: string;
+    type: string;
+    amount: number;
+    items?: SalesRecordItem[];
+  }) => {
+    if (!tenantId || !storeId) return;
+    if (entry.type !== "Sale" && entry.type !== "Payment") return;
+
+    setRemovingEntryId(entry.id);
+    try {
+      await voidEntry({
+        entryId: entry.id,
+        entryType: entry.type === "Sale" ? "SALE" : "PAYMENT",
+        storeId,
+        tenantId,
+        amount: Math.abs(entry.amount),
+        items: entry.items,
+      });
+    } catch (error) {
+      console.error("Failed to remove entry:", error);
+      alert("Failed to remove entry. Please try again.");
+    } finally {
+      setRemovingEntryId(null);
+    }
+  };
+
+  const activeSalesRecords = useMemo(
+    () => salesRecords.filter((sale) => !sale.voided),
+    [salesRecords],
+  );
+  const activePayments = useMemo(
+    () => payments.filter((payment) => !payment.voided),
+    [payments],
+  );
 
   const timeline = useMemo(() => {
     const entries = [
@@ -256,26 +378,30 @@ export default function StoreDetailClient({ storeId }: Props) {
         date: log.date,
         amount: 0,
         detail: log.items.map((i) => `${i.productId}: ${i.quantity}`).join(", "),
+        canRemove: false,
       })),
-      ...salesRecords.map((sale) => ({
+      ...activeSalesRecords.map((sale) => ({
         id: sale.id,
         type: "Sale",
         date: sale.date,
-        amount: sale.totalAmount,
+        amount: sale.totalAmount ?? 0,
         detail: `${sale.items.length} items`,
+        items: sale.items,
+        canRemove: true,
       })),
-      ...payments.map((p) => ({
+      ...activePayments.map((p) => ({
         id: p.id,
         type: "Payment",
         date: p.date as Timestamp,
-        amount: -Math.abs(p.amount),
+        amount: -Math.abs(p.amount ?? 0),
         detail: p.note || "",
+        canRemove: true,
       })),
     ];
     return entries.sort(
       (a, b) => toDate(b.date).getTime() - toDate(a.date).getTime(),
     );
-  }, [inventoryLogs, payments, salesRecords]);
+  }, [activePayments, activeSalesRecords, inventoryLogs]);
 
   const downloadStatement = () => {
     if (!store) return;
@@ -308,7 +434,8 @@ export default function StoreDetailClient({ storeId }: Props) {
       headStyles: { fillColor: [20, 20, 20], textColor: 230 },
       startY: 34,
     });
-    const finalY = (docPdf as any).lastAutoTable?.finalY as number | undefined;
+    const tableDoc = docPdf as typeof docPdf & { lastAutoTable?: { finalY?: number } };
+    const finalY = tableDoc.lastAutoTable?.finalY;
     docPdf.text(
       `Total Due: ${formatMoney(balance?.currentBalance ?? running)}`,
       14,
@@ -318,6 +445,14 @@ export default function StoreDetailClient({ storeId }: Props) {
   };
 
   const currentBalance = balance?.currentBalance ?? 0;
+
+  if (unauthorized) {
+    return <div className="text-red-400">You do not have access to this store.</div>;
+  }
+
+  if (!tenantId) {
+    return <div className="text-slate-400">Loading account...</div>;
+  }
 
   if (!store) {
     return <div className="text-slate-400">Loading store...</div>;
@@ -361,6 +496,7 @@ export default function StoreDetailClient({ storeId }: Props) {
         </TabsList>
 
         <TabsContent value="actions" className="space-y-4">
+
           <div className="grid gap-4 md:grid-cols-3">
             <Card>
               <CardHeader>
@@ -373,7 +509,16 @@ export default function StoreDetailClient({ storeId }: Props) {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <Dialog open={deliveryOpen} onOpenChange={setDeliveryOpen}>
+                <Dialog
+                  open={deliveryOpen}
+                  onOpenChange={(open) => {
+                    setDeliveryOpen(open);
+                    if (!open) {
+                      setDeliveryQty("");
+                      setDeliveryError(undefined);
+                    }
+                  }}
+                >
                   <DialogTrigger asChild>
                     <Button className="w-full">
                       <Plus className="mr-2 h-4 w-4" />
@@ -390,9 +535,12 @@ export default function StoreDetailClient({ storeId }: Props) {
                     <div className="space-y-3">
                       <Label>Product</Label>
                       <select
-                        className="w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-sm text-slate-100"
+                        className="w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-base text-slate-100"
                         value={deliveryProduct}
-                        onChange={(e) => setDeliveryProduct(e.target.value)}
+                        onChange={(e) => {
+                          setDeliveryProduct(e.target.value);
+                          if (deliveryError) setDeliveryError(undefined);
+                        }}
                       >
                         <option value="">Select product</option>
                         {products.map((p) => (
@@ -404,11 +552,23 @@ export default function StoreDetailClient({ storeId }: Props) {
                       <Label>Quantity</Label>
                       <Input
                         type="number"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
                         value={deliveryQty}
-                        onChange={(e) => setDeliveryQty(Number(e.target.value))}
+                        onChange={(e) => {
+                          setDeliveryQty(e.target.value);
+                          if (deliveryError) {
+                            setDeliveryError(undefined);
+                          }
+                        }}
                       />
+                      {deliveryError && (
+                        <p className="text-xs text-red-400">{deliveryError}</p>
+                      )}
                       <Button
-                        disabled={!deliveryProduct || deliveryQty <= 0}
+                        disabled={
+                          !deliveryProduct || !!validateQuantity(deliveryQty)
+                        }
                         onClick={handleDelivery}
                         className="w-full sm:w-auto"
                       >
@@ -446,15 +606,30 @@ export default function StoreDetailClient({ storeId }: Props) {
                       <Input
                         className="mt-2"
                         type="number"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
                         value={countValues[product.id] ?? ""}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const value = e.target.value;
                           setCountValues((prev) => ({
                             ...prev,
-                            [product.id]: Number(e.target.value),
-                          }))
-                        }
+                            [product.id]: value,
+                          }));
+                          if (countErrors[product.id]) {
+                            setCountErrors((prev) => {
+                              const next = { ...prev };
+                              delete next[product.id];
+                              return next;
+                            });
+                          }
+                        }}
                         placeholder="Counted"
                       />
+                      {countErrors[product.id] && (
+                        <p className="mt-1 text-xs text-red-400">
+                          {countErrors[product.id]}
+                        </p>
+                      )}
                       <p className="mt-1 text-xs text-slate-500">
                         Unit price:{" "}
                         {formatMoney(priceMap.get(product.id) ?? product.defaultPrice)}
@@ -483,6 +658,7 @@ export default function StoreDetailClient({ storeId }: Props) {
             <CardContent className="grid gap-3 sm:grid-cols-2 md:grid-cols-3">
               <Input
                 type="number"
+                inputMode="decimal"
                 placeholder="Amount"
                 value={paymentAmount}
                 onChange={(e) => setPaymentAmount(e.target.value)}
@@ -496,7 +672,7 @@ export default function StoreDetailClient({ storeId }: Props) {
                 variant="outline"
                 className="border-slate-800 w-full sm:w-auto"
                 onClick={handlePayment}
-                disabled={!paymentAmount}
+                disabled={!paymentAmount || Number(paymentAmount) <= 0}
               >
                 Apply Payment
               </Button>
@@ -554,16 +730,29 @@ export default function StoreDetailClient({ storeId }: Props) {
                       <p className="text-sm text-slate-400">{entry.detail}</p>
                     </div>
                   </div>
-                  <div
-                    className={`mt-2 text-lg font-semibold sm:mt-0 ${
-                      entry.amount > 0
-                        ? "text-emerald-300"
-                        : entry.amount < 0
-                          ? "text-red-300"
-                          : "text-slate-200"
-                    }`}
-                  >
-                    {formatMoney(entry.amount)}
+                  <div className="mt-2 flex items-center gap-3 sm:mt-0">
+                    <div
+                      className={`text-lg font-semibold ${
+                        entry.amount > 0
+                          ? "text-emerald-300"
+                          : entry.amount < 0
+                            ? "text-red-300"
+                            : "text-slate-200"
+                      }`}
+                    >
+                      {formatMoney(entry.amount)}
+                    </div>
+                    {entry.canRemove && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRemoveEntry(entry)}
+                        disabled={removingEntryId === entry.id}
+                        className="h-8 w-8 p-0 text-red-400 hover:text-red-300 hover:bg-red-950/30"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -607,13 +796,17 @@ export default function StoreDetailClient({ storeId }: Props) {
                 className="w-full sm:col-span-2 sm:w-auto"
                 disabled={updatingStore}
                 onClick={async () => {
-                  if (!store) return;
+                  if (!store || !tenantId) return;
                   setUpdatingStore(true);
-                  await updateStore(store.id, {
-                    phone: store.phone,
-                    location: store.location,
-                    notes: store.notes,
-                  });
+                  await updateStore(
+                    store.id,
+                    {
+                      phone: store.phone,
+                      location: store.location,
+                      notes: store.notes,
+                    },
+                    tenantId,
+                  );
                   setUpdatingStore(false);
                 }}
               >
@@ -644,6 +837,7 @@ export default function StoreDetailClient({ storeId }: Props) {
                   <Input
                     className="mt-2"
                     type="number"
+                    inputMode="decimal"
                     defaultValue={priceMap.get(product.id) ?? product.defaultPrice}
                     onBlur={(e) =>
                       setPricingForProduct(product.id, Number(e.target.value))
